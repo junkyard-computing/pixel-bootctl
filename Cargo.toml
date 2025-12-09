@@ -1,0 +1,9 @@
+[package]
+name = "pixel-devinfo"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+byteorder = "1.5.0"
+clap = { version = "4.5.53", features = ["derive"] }
