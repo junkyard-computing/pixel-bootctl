@@ -8,6 +8,8 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use byteorder::ByteOrder;
 use byteorder::LittleEndian;
@@ -58,13 +60,18 @@ impl SlotData {
 /// other fields in the binary.
 #[derive(Copy, Clone)]
 struct Devinfo {
+    /// Magic field. Should be "DEVI" in UTF-8 or ASCII.
     magic: u32,
+    /// Major version. Nominally 3.
     major_version: u16,
+    /// Minor version.
     minor_version: u16,
+    /// A and B slots.
     slots: [SlotData; 2],
 }
 
 impl Devinfo {
+    /// Initializes [`Devinfo`] by reading from the given buffer.
     fn from(data: &[u8]) -> Self {
         let magic = LittleEndian::read_u32(&data[0..4]);
         let major_version = LittleEndian::read_u16(&data[4..6]);
@@ -79,6 +86,10 @@ impl Devinfo {
         }
     }
 
+    /// Writes the representation of Devinfo into a [`Write`] + [`Seek`].
+    ///
+    /// This is implemented in such a way that if this is acting on a buffer with data, only the
+    /// [`Devinfo`] fields are updated, leaving any other data intact.
     fn write_to<W: Write + Seek + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&self.magic.to_le_bytes())?;
         writer.write_all(&self.major_version.to_le_bytes())?;
@@ -91,21 +102,30 @@ impl Devinfo {
 
 #[derive(Parser)]
 struct Args {
-    /// Input file to parse
+    /// Input file to parse.
     input: PathBuf,
     /// Optional output file to write modification, successful bit is set, unbootable is cleared,
     /// and retries are set to 7.
     output: Option<PathBuf>,
+    /// Slot to mark as active and possibly modify.
     #[arg(short, long)]
     slot: Option<char>,
+    /// Value to set the retries field to.
     #[arg(short, long)]
     retries: Option<u8>,
+    /// Whether to mark the successful field as true or false.
     #[arg(short = 'S', long)]
     successful: Option<bool>,
+    /// Whether to mark the unbootable field as true or false.
     #[arg(short, long)]
     unbootable: Option<bool>,
+    /// Whether to mark the fastboot_ok field as true or false.
     #[arg(short, long)]
+    #[allow(clippy::doc_markdown)] // fastboot_ok is a field in the actual devinfo.
     fastboot_ok: Option<bool>,
+    /// If true, no output is emitted on stdout.
+    #[arg(short, long, default_value_t = false)]
+    quiet: bool,
 }
 
 // clippy complains about dead_code even though std::process:Termination uses Debug...
@@ -123,37 +143,41 @@ impl From<io::Error> for Error {
     }
 }
 
+/// Flag denoting whether to output to stdout or not.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Custom println!, prevents printing if [`QUIET`] is true.
+macro_rules! myprintln {
+    ($($arg:tt)*) => {
+        if !QUIET.load(Ordering::Relaxed) {
+            println!($($arg)*);
+        }
+    }
+}
+
 fn main() -> Result<(), Error> {
     let args = Args::parse();
     let path = &args.input;
+    QUIET.store(args.quiet, Ordering::Relaxed);
 
     let mut file = File::open(path)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
+
+    // Check magic 4 bytes
     if &buffer[0..4] != b"DEVI" {
         return Err(Error::Devinfo("Not a devinfo partition".to_string()));
     }
-    let devinfo = Devinfo::from(&buffer);
-    println!(
-        "Version {}.{}",
-        devinfo.major_version, devinfo.minor_version
+    let mut devinfo = Devinfo::from(&buffer);
+    myprintln!(
+        "devinfo Version {}.{}",
+        devinfo.major_version,
+        devinfo.minor_version
     );
 
+    // This assumes there are only two slots
     let active_slot = usize::from(!devinfo.slots[0].active);
-    let mut slot_counter: u8 = 65;
-    for slot in devinfo.slots {
-        println!("slot: {}", slot_counter as char);
-        println!("    retry count: {}", slot.retry_count);
-        println!("    successful: {}", slot.successful);
-        println!("    unbootable: {}", slot.unbootable);
-        println!("    active: {}", slot.active);
-        println!("    fastboot ok: {}", slot.fastboot_ok);
-        slot_counter += 1;
-    }
-
     if let Some(output) = args.output {
-        let mut devinfo_copy = devinfo;
-
         let active_slot = args
             .slot
             .map_or(Ok(active_slot), |active_slot| match active_slot {
@@ -164,31 +188,47 @@ fn main() -> Result<(), Error> {
 
         // Update active slot, and deactivate the other one...
         // This assumes there are only two slots!
-        devinfo_copy.slots[active_slot].active = true;
-        devinfo_copy.slots[(active_slot + 1) % 2].active = false;
+        devinfo.slots[active_slot].active = true;
+        devinfo.slots[(active_slot + 1) % 2].active = false;
 
+        // And now update fields if they've been provided
         if let Some(retry_count) = args.retries {
-            devinfo_copy.slots[active_slot].retry_count = retry_count;
+            devinfo.slots[active_slot].retry_count = retry_count;
         }
 
         if let Some(successful) = args.successful {
-            devinfo_copy.slots[active_slot].successful = successful;
+            devinfo.slots[active_slot].successful = successful;
         }
 
         if let Some(unbootable) = args.unbootable {
-            devinfo_copy.slots[active_slot].unbootable = unbootable;
+            devinfo.slots[active_slot].unbootable = unbootable;
         }
 
         if let Some(fastboot_ok) = args.fastboot_ok {
-            devinfo_copy.slots[active_slot].fastboot_ok = fastboot_ok;
+            devinfo.slots[active_slot].fastboot_ok = fastboot_ok;
         }
 
+        // And now create the output file
         let mut output = File::create(output)?;
         // There are a lot of extra fields, effectively copy everything over to the new file first
         output.write_all(&buffer)?;
         // And now write any adjustments to the devinfo fields
         output.seek(SeekFrom::Start(0))?;
-        devinfo_copy.write_to(&mut output)?;
+        devinfo.write_to(&mut output)?;
+    }
+
+    for (index, slot) in devinfo.slots.iter().enumerate() {
+        let slot_name = match index {
+            0 => 'A',
+            _ => 'B',
+        };
+
+        myprintln!("slot: {}", slot_name);
+        myprintln!("    retry count: {}", slot.retry_count);
+        myprintln!("    successful: {}", slot.successful);
+        myprintln!("    unbootable: {}", slot.unbootable);
+        myprintln!("    active: {}", slot.active);
+        myprintln!("    fastboot ok: {}", slot.fastboot_ok);
     }
     Ok(())
 }
