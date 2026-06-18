@@ -1,234 +1,184 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Gabriel Marcano, 2025
+//
+// pixel-bootctl: A/B boot-slot control for a Pixel (Tensor) running Linux — the userspace
+// analog of Android's `bootctl` / boot_control HAL.
+//
+// MECHANISM (confirmed on felix from device/google/gs-common/bootctrl + live test):
+// setActiveBootSlot writes the UFS boot-LUN attribute via the Pixel kernel sysfs node
+// /sys/devices/platform/<ufs>/pixel/boot_lun_enabled ("1"=A, "2"=B) — the real switch — and
+// updates the devinfo active/successful/retry flags as bookkeeping. No fastboot/keys/GSA/Trusty.
 
-use std::fs::File;
-use std::io;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::io::Write;
+mod bootlun;
+mod devinfo;
+mod hexutil;
+mod trusty;
+
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 
-use byteorder::ByteOrder;
-use byteorder::LittleEndian;
+use clap::{Parser, Subcommand};
 
-use clap::Parser;
-
-/// Information about the slot
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Copy, Clone)]
-struct SlotData {
-    retry_count: u8,
-    unbootable: bool,
-    successful: bool,
-    active: bool,
-    fastboot_ok: bool,
-}
-
-impl SlotData {
-    fn from(data: &[u8]) -> Self {
-        let retry_count = data[0];
-        let unbootable = (data[1] & 0b0001) != 0;
-        let successful = (data[1] & 0b0010) != 0;
-        let active = (data[1] & 0b0100) != 0;
-        let fastboot_ok = (data[1] & 0b1000) != 0;
-        Self {
-            retry_count,
-            unbootable,
-            successful,
-            active,
-            fastboot_ok,
-        }
-    }
-
-    fn write_to<W: Write + ?Sized>(self, writer: &mut W) -> io::Result<()> {
-        let mut result = [0u8; 4];
-        result[0] = self.retry_count;
-        result[1] = u8::from(self.unbootable)
-            | u8::from(self.successful) << 1
-            | u8::from(self.active) << 2
-            | u8::from(self.fastboot_ok) << 3;
-        writer.write_all(&result)
-    }
-}
-
-/// Some of the devinfo partition fields.
-///
-/// From what I can tell, these are the main fields used for booting purposes, but there seem to be
-/// other fields in the binary.
-#[derive(Copy, Clone)]
-struct Devinfo {
-    /// Magic field. Should be "DEVI" in UTF-8 or ASCII.
-    magic: u32,
-    /// Major version. Nominally 3.
-    major_version: u16,
-    /// Minor version.
-    minor_version: u16,
-    /// A and B slots.
-    slots: [SlotData; 2],
-}
-
-impl Devinfo {
-    /// Initializes [`Devinfo`] by reading from the given buffer.
-    fn from(data: &[u8]) -> Self {
-        let magic = LittleEndian::read_u32(&data[0..4]);
-        let major_version = LittleEndian::read_u16(&data[4..6]);
-        let minor_version = LittleEndian::read_u16(&data[6..8]);
-        let slot_a = SlotData::from(&data[48..52]);
-        let slot_b = SlotData::from(&data[52..56]);
-        Self {
-            magic,
-            major_version,
-            minor_version,
-            slots: [slot_a, slot_b],
-        }
-    }
-
-    /// Writes the representation of Devinfo into a [`Write`] + [`Seek`].
-    ///
-    /// This is implemented in such a way that if this is acting on a buffer with data, only the
-    /// [`Devinfo`] fields are updated, leaving any other data intact.
-    fn write_to<W: Write + Seek + ?Sized>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&self.magic.to_le_bytes())?;
-        writer.write_all(&self.major_version.to_le_bytes())?;
-        writer.write_all(&self.minor_version.to_le_bytes())?;
-        writer.seek(SeekFrom::Start(48))?;
-        self.slots[0].write_to(writer)?;
-        self.slots[1].write_to(writer)
-    }
-}
+use devinfo::Devinfo;
 
 #[derive(Parser)]
+#[command(
+    name = "pixel-bootctl",
+    about = "A/B boot-slot control for Pixel-on-Linux"
+)]
 struct Args {
-    /// Input file to parse.
-    input: PathBuf,
-    /// Optional output file to write modification, successful bit is set, unbootable is cleared,
-    /// and retries are set to 7.
-    output: Option<PathBuf>,
-    /// Slot to mark as active and possibly modify.
-    #[arg(short, long)]
-    slot: Option<char>,
-    /// Value to set the retries field to.
-    #[arg(short, long)]
-    retries: Option<u8>,
-    /// Whether to mark the successful field as true or false.
-    #[arg(short = 'S', long)]
-    successful: Option<bool>,
-    /// Whether to mark the unbootable field as true or false.
-    #[arg(short, long)]
-    unbootable: Option<bool>,
-    /// Whether to mark the fastboot_ok field as true or false.
-    #[arg(short, long)]
-    #[allow(clippy::doc_markdown)] // fastboot_ok is a field in the actual devinfo.
-    fastboot_ok: Option<bool>,
-    /// If true, no output is emitted on stdout.
-    #[arg(short, long, default_value_t = false)]
-    quiet: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-// clippy complains about dead_code even though std::process:Termination uses Debug...
-#[derive(Debug)]
-enum Error {
-    #[allow(dead_code)]
-    Io(io::Error),
-    #[allow(dead_code)]
-    Devinfo(String),
+#[derive(Subcommand)]
+enum Cmd {
+    /// Read and print A/B slot state from devinfo.
+    Status {
+        #[arg(long, default_value = devinfo::DEVINFO_PATH)]
+        devinfo: PathBuf,
+    },
+    /// Set the active boot slot (a|b): flips the UFS boot LUN + updates devinfo flags.
+    SetActiveSlot {
+        /// Target slot: a or b.
+        slot: char,
+        #[arg(long, default_value = devinfo::DEVINFO_PATH)]
+        devinfo: PathBuf,
+        /// boot_lun_enabled sysfs path (auto-detected if omitted).
+        #[arg(long)]
+        boot_lun: Option<PathBuf>,
+    },
+    /// Probe which Trusty service ports accept a connection (diagnostic).
+    Probe {
+        #[arg(long, default_value = trusty::DEFAULT_DEV)]
+        dev: String,
+        /// Probe a single port instead of the built-in candidate list.
+        #[arg(long)]
+        port: Option<String>,
+    },
+    /// Connect to a Trusty port, send hex bytes, print any response (diagnostic).
+    Send {
+        #[arg(long, default_value = trusty::DEFAULT_DEV)]
+        dev: String,
+        #[arg(long)]
+        port: String,
+        /// Hex payload, e.g. "01000000".
+        #[arg(long)]
+        hex: String,
+        #[arg(long, default_value_t = 1000)]
+        timeout_ms: i32,
+    },
 }
 
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
+fn cmd_status(path: &PathBuf) -> io::Result<()> {
+    let mut buf = Vec::new();
+    File::open(path)?.read_to_end(&mut buf)?;
+    let d = Devinfo::parse(&buf)?;
+    println!("devinfo Version {}.{}", d.major_version, d.minor_version);
+    for (i, s) in d.slots.iter().enumerate() {
+        println!("slot: {}", if i == 0 { 'A' } else { 'B' });
+        println!("    retry count: {}", s.retry_count);
+        println!("    successful:  {}", s.successful);
+        println!("    unbootable:  {}", s.unbootable);
+        println!("    active:      {}", s.active);
+        println!("    fastboot ok: {}", s.fastboot_ok);
     }
+    Ok(())
 }
 
-/// Flag denoting whether to output to stdout or not.
-static QUIET: AtomicBool = AtomicBool::new(false);
+fn cmd_set_active(
+    slot_char: char,
+    devinfo_path: &PathBuf,
+    boot_lun: Option<PathBuf>,
+) -> io::Result<()> {
+    let slot = devinfo::parse_slot(slot_char)?;
 
-/// Custom println!, prevents printing if [`QUIET`] is true.
-macro_rules! myprintln {
-    ($($arg:tt)*) => {
-        if !QUIET.load(Ordering::Relaxed) {
-            println!($($arg)*);
-        }
-    }
-}
-
-fn main() -> Result<(), Error> {
-    let args = Args::parse();
-    let path = &args.input;
-    QUIET.store(args.quiet, Ordering::Relaxed);
-
-    let mut file = File::open(path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-
-    // Check magic 4 bytes
-    if &buffer[0..4] != b"DEVI" {
-        return Err(Error::Devinfo("Not a devinfo partition".to_string()));
-    }
-    let mut devinfo = Devinfo::from(&buffer);
-    myprintln!(
-        "devinfo Version {}.{}",
-        devinfo.major_version,
-        devinfo.minor_version
+    // 1) The real switch: UFS boot LUN.
+    let lun_path = bootlun::set(slot, boot_lun)?;
+    println!(
+        "boot LUN: wrote {} to {}",
+        bootlun::lun_value(slot),
+        lun_path.display()
     );
 
-    // This assumes there are only two slots
-    let active_slot = usize::from(!devinfo.slots[0].active);
-    if let Some(output) = args.output {
-        let active_slot = args
-            .slot
-            .map_or(Ok(active_slot), |active_slot| match active_slot {
-                'A' => Ok(0),
-                'B' => Ok(1),
-                _ => Err(Error::Devinfo(format!("Invalid slot given: {active_slot}"))),
-            })?;
+    // 2) Bookkeeping: devinfo active/successful/retry flags.
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(devinfo_path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    devinfo::apply_set_active(&mut buf, slot)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    println!(
+        "devinfo: slot {} marked active+successful (retry 7)",
+        slot_char.to_ascii_uppercase()
+    );
+    println!(
+        "done. reboot to boot slot {}.",
+        slot_char.to_ascii_uppercase()
+    );
+    Ok(())
+}
 
-        // Update active slot, and deactivate the other one...
-        // This assumes there are only two slots!
-        devinfo.slots[active_slot].active = true;
-        devinfo.slots[(active_slot + 1) % 2].active = false;
-
-        // And now update fields if they've been provided
-        if let Some(retry_count) = args.retries {
-            devinfo.slots[active_slot].retry_count = retry_count;
+fn cmd_probe(dev: &str, single: Option<&str>) {
+    let ports: Vec<&str> = match single {
+        Some(p) => vec![p],
+        None => trusty::CANDIDATE_PORTS.to_vec(),
+    };
+    println!("probing {} via {}", ports.len(), dev);
+    for port in ports {
+        match trusty::connect(dev, port) {
+            Ok(fd) => {
+                println!("  [CONNECTED] {port}");
+                trusty::close(fd);
+            }
+            Err(e) => {
+                let code = e.raw_os_error().unwrap_or(-1);
+                println!("  [   {code:>3} ] {port}  ({e})");
+            }
         }
-
-        if let Some(successful) = args.successful {
-            devinfo.slots[active_slot].successful = successful;
-        }
-
-        if let Some(unbootable) = args.unbootable {
-            devinfo.slots[active_slot].unbootable = unbootable;
-        }
-
-        if let Some(fastboot_ok) = args.fastboot_ok {
-            devinfo.slots[active_slot].fastboot_ok = fastboot_ok;
-        }
-
-        // And now create the output file
-        let mut output = File::create(output)?;
-        // There are a lot of extra fields, effectively copy everything over to the new file first
-        output.write_all(&buffer)?;
-        // And now write any adjustments to the devinfo fields
-        output.seek(SeekFrom::Start(0))?;
-        devinfo.write_to(&mut output)?;
     }
+}
 
-    for (index, slot) in devinfo.slots.iter().enumerate() {
-        let slot_name = match index {
-            0 => 'A',
-            _ => 'B',
-        };
+fn cmd_send(dev: &str, port: &str, hex: &str, timeout_ms: i32) -> io::Result<()> {
+    let payload =
+        hexutil::decode(hex).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let fd = trusty::connect(dev, port)?;
+    println!("connected to {port}, sending {} bytes", payload.len());
+    println!("wrote {} bytes", trusty::send(fd, &payload)?);
+    let resp = trusty::recv(fd, timeout_ms, 4096)?;
+    if resp.is_empty() {
+        println!("no response (timeout {timeout_ms}ms)");
+    } else {
+        println!(
+            "response ({} bytes): {}",
+            resp.len(),
+            hexutil::encode(&resp)
+        );
+    }
+    trusty::close(fd);
+    Ok(())
+}
 
-        myprintln!("slot: {}", slot_name);
-        myprintln!("    retry count: {}", slot.retry_count);
-        myprintln!("    successful: {}", slot.successful);
-        myprintln!("    unbootable: {}", slot.unbootable);
-        myprintln!("    active: {}", slot.active);
-        myprintln!("    fastboot ok: {}", slot.fastboot_ok);
+fn main() -> io::Result<()> {
+    match Args::parse().cmd {
+        Cmd::Status { devinfo } => cmd_status(&devinfo)?,
+        Cmd::SetActiveSlot {
+            slot,
+            devinfo,
+            boot_lun,
+        } => cmd_set_active(slot, &devinfo, boot_lun)?,
+        Cmd::Probe { dev, port } => cmd_probe(&dev, port.as_deref()),
+        Cmd::Send {
+            dev,
+            port,
+            hex,
+            timeout_ms,
+        } => cmd_send(&dev, &port, &hex, timeout_ms)?,
     }
     Ok(())
 }
