@@ -43,6 +43,13 @@ pixel-bootctl set-active-slot <a|b> [--devinfo PATH] [--boot-lun PATH]
         /sys/devices/platform/*.ufs/pixel/boot_lun_enabled node) and mark the target slot
         active+successful (retry 7) in devinfo. Reboot to take effect.
 
+pixel-bootctl mark-successful [--devinfo PATH] [--slot <a|b>]
+        Mark the running slot (from androidboot.slot_suffix; override with --slot) successful
+        in devinfo: retry=7, successful, clear unbootable, active (and deactivate the other
+        slot). devinfo-ONLY — does NOT touch the boot LUN — so it keeps the bootloader's retry
+        counter from exhausting (and dropping to fastboot) on every boot. Run it from a
+        post-boot systemd unit.
+
 pixel-bootctl probe [--dev /dev/trusty-ipc-dev0] [--port NAME]
         Enumerate which Trusty IPC service ports accept a connection (diagnostic).
 

@@ -12,6 +12,7 @@
 mod bootlun;
 mod devinfo;
 mod hexutil;
+mod slot;
 mod trusty;
 
 use std::fs::{File, OpenOptions};
@@ -48,6 +49,15 @@ enum Cmd {
         /// boot_lun_enabled sysfs path (auto-detected if omitted).
         #[arg(long)]
         boot_lun: Option<PathBuf>,
+    },
+    /// Mark the running (or given) slot successful in devinfo — retry=7, successful, clear
+    /// unbootable. Does NOT touch the boot LUN.
+    MarkSuccessful {
+        #[arg(long, default_value = devinfo::DEVINFO_PATH)]
+        devinfo: PathBuf,
+        /// Slot to mark (a|b); defaults to the running slot (androidboot.slot_suffix).
+        #[arg(long)]
+        slot: Option<char>,
     },
     /// Probe which Trusty service ports accept a connection (diagnostic).
     Probe {
@@ -124,6 +134,32 @@ fn cmd_set_active(
     Ok(())
 }
 
+fn cmd_mark_successful(devinfo_path: &PathBuf, slot_override: Option<char>) -> io::Result<()> {
+    // The running slot is authoritative; only fall back to it when no override is given.
+    let slot = match slot_override {
+        Some(c) => devinfo::parse_slot(c)?,
+        None => slot::current()?,
+    };
+
+    // devinfo bookkeeping ONLY — deliberately no bootlun::set, so the per-boot retry-counter
+    // reset keeps working even if the UFS boot_lun_enabled node can't be located.
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(devinfo_path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    devinfo::apply_set_active(&mut buf, slot)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    println!(
+        "devinfo: slot {} marked successful (retry 7)",
+        if slot == 0 { 'A' } else { 'B' }
+    );
+    Ok(())
+}
+
 fn cmd_probe(dev: &str, single: Option<&str>) {
     let ports: Vec<&str> = match single {
         Some(p) => vec![p],
@@ -172,6 +208,7 @@ fn main() -> io::Result<()> {
             devinfo,
             boot_lun,
         } => cmd_set_active(slot, &devinfo, boot_lun)?,
+        Cmd::MarkSuccessful { devinfo, slot } => cmd_mark_successful(&devinfo, slot)?,
         Cmd::Probe { dev, port } => cmd_probe(&dev, port.as_deref()),
         Cmd::Send {
             dev,
