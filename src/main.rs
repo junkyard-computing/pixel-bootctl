@@ -7,7 +7,8 @@
 // MECHANISM (confirmed on felix from device/google/gs-common/bootctrl + live test):
 // setActiveBootSlot writes the UFS boot-LUN attribute via the Pixel kernel sysfs node
 // /sys/devices/platform/<ufs>/pixel/boot_lun_enabled ("1"=A, "2"=B) — the real switch — and
-// updates the devinfo active/successful/retry flags as bookkeeping. No fastboot/keys/GSA/Trusty.
+// updates the devinfo active/retry flags as bookkeeping. `successful` is set separately, only
+// after a confirmed-good boot (markBootSuccessful), so A/B rollback works. No fastboot/keys/Trusty.
 
 mod bootlun;
 mod devinfo;
@@ -40,7 +41,9 @@ enum Cmd {
         #[arg(long, default_value = devinfo::DEVINFO_PATH)]
         devinfo: PathBuf,
     },
-    /// Set the active boot slot (a|b): flips the UFS boot LUN + updates devinfo flags.
+    /// Set the active boot slot (a|b): flips the UFS boot LUN + updates devinfo flags. Rollback-
+    /// safe by default — the new slot is marked active but NOT successful, so a slot that never
+    /// boots rolls back. Confirm it with `mark-successful` after a good boot.
     SetActiveSlot {
         /// Target slot: a or b.
         slot: char,
@@ -49,6 +52,10 @@ enum Cmd {
         /// boot_lun_enabled sysfs path (auto-detected if omitted).
         #[arg(long)]
         boot_lun: Option<PathBuf>,
+        /// Also mark the slot successful immediately (force-trust; DISABLES rollback). For
+        /// manual recovery only — normally let a post-boot health check call `mark-successful`.
+        #[arg(long)]
+        mark_successful: bool,
     },
     /// Mark the running (or given) slot successful in devinfo — retry=7, successful, clear
     /// unbootable. Does NOT touch the boot LUN.
@@ -101,6 +108,7 @@ fn cmd_set_active(
     slot_char: char,
     devinfo_path: &PathBuf,
     boot_lun: Option<PathBuf>,
+    mark_successful: bool,
 ) -> io::Result<()> {
     let slot = devinfo::parse_slot(slot_char)?;
 
@@ -112,25 +120,29 @@ fn cmd_set_active(
         lun_path.display()
     );
 
-    // 2) Bookkeeping: devinfo active/successful/retry flags.
+    // 2) Bookkeeping: devinfo active/retry flags (+ successful only with --mark-successful).
     let mut f = OpenOptions::new()
         .read(true)
         .write(true)
         .open(devinfo_path)?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
-    devinfo::apply_set_active(&mut buf, slot)?;
+    devinfo::apply_set_active(&mut buf, slot, mark_successful)?;
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&buf)?;
     f.sync_all()?;
-    println!(
-        "devinfo: slot {} marked active+successful (retry 7)",
-        slot_char.to_ascii_uppercase()
-    );
-    println!(
-        "done. reboot to boot slot {}.",
-        slot_char.to_ascii_uppercase()
-    );
+    let su = slot_char.to_ascii_uppercase();
+    if mark_successful {
+        println!(
+            "devinfo: slot {su} marked active+successful (retry 7) — force-trust, NO rollback"
+        );
+    } else {
+        println!(
+            "devinfo: slot {su} marked active, NOT successful (retry 7) — rolls back unless a good \
+             boot runs `pixel-bootctl mark-successful`"
+        );
+    }
+    println!("done. reboot to boot slot {su}.");
     Ok(())
 }
 
@@ -149,7 +161,7 @@ fn cmd_mark_successful(devinfo_path: &PathBuf, slot_override: Option<char>) -> i
         .open(devinfo_path)?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
-    devinfo::apply_set_active(&mut buf, slot)?;
+    devinfo::apply_mark_successful(&mut buf, slot)?;
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&buf)?;
     f.sync_all()?;
@@ -207,7 +219,8 @@ fn main() -> io::Result<()> {
             slot,
             devinfo,
             boot_lun,
-        } => cmd_set_active(slot, &devinfo, boot_lun)?,
+            mark_successful,
+        } => cmd_set_active(slot, &devinfo, boot_lun, mark_successful)?,
         Cmd::MarkSuccessful { devinfo, slot } => cmd_mark_successful(&devinfo, slot)?,
         Cmd::Probe { dev, port } => cmd_probe(&dev, port.as_deref()),
         Cmd::Send {
