@@ -127,6 +127,23 @@ pub fn apply_mark_successful(buf: &mut [u8], slot: usize) -> io::Result<()> {
     Ok(())
 }
 
+/// In place, mark `slot` UNBOOTABLE: set UNBOOTABLE, clear ACTIVE + SUCCESSFUL, zero the retry
+/// counter, and make the *other* slot ACTIVE. Does **not** touch the boot LUN — this is the
+/// mainline-friendly rollback primitive: on mainline the UFS `boot_lun_enabled` node is read-only,
+/// so `set-active-slot` can't switch away, but devinfo *is* writable and the bootloader honors
+/// UNBOOTABLE to override the boot LUN (the same path the retry-counter rollback takes). The other
+/// slot must already be SUCCESSFUL for the rollback to land. `slot` must be 0 or 1.
+pub fn apply_mark_unbootable(buf: &mut [u8], slot: usize) -> io::Result<()> {
+    check(buf)?;
+    assert!(slot < 2);
+    let t = slot_offset(slot);
+    let o = slot_offset((slot + 1) % 2);
+    buf[t] = 0; // exhaust the retry budget
+    buf[t + 1] = (buf[t + 1] & !F_ACTIVE & !F_SUCCESSFUL) | F_UNBOOTABLE;
+    buf[o + 1] |= F_ACTIVE; // give the bootloader a clear target
+    Ok(())
+}
+
 /// Parse a slot letter to an index (a/A -> 0, b/B -> 1).
 pub fn parse_slot(c: char) -> io::Result<usize> {
     match c.to_ascii_lowercase() {
@@ -224,6 +241,33 @@ mod tests {
         assert!(d.slots[1].active && d.slots[1].successful && d.slots[1].retry_count == 7);
         // Must not disturb ACTIVE bits: A stays inactive, B stays active.
         assert!(!d.slots[0].active);
+    }
+
+    #[test]
+    fn mark_unbootable_forces_rollback_to_other_slot() {
+        let mut b = sample(); // A active+successful (retry 7), B successful
+        apply_mark_unbootable(&mut b, 0).unwrap();
+        let d = Devinfo::parse(&b).unwrap();
+        // A: unbootable, not active, not successful, retry exhausted.
+        assert!(
+            d.slots[0].unbootable
+                && !d.slots[0].active
+                && !d.slots[0].successful
+                && d.slots[0].retry_count == 0
+        );
+        // B: now the active target, still successful so the rollback lands.
+        assert!(d.slots[1].active && d.slots[1].successful);
+        // Bytes outside the two flag/retry bytes are untouched (magic + version intact).
+        assert_eq!(&b[0..8], &sample()[0..8]);
+    }
+
+    #[test]
+    fn set_active_reverses_mark_unbootable() {
+        let mut b = sample();
+        apply_mark_unbootable(&mut b, 0).unwrap(); // roll A away
+        apply_set_active(&mut b, 0, false).unwrap(); // later re-select A from the good slot
+        let d = Devinfo::parse(&b).unwrap();
+        assert!(d.slots[0].active && !d.slots[0].unbootable && d.slots[0].retry_count == 7);
     }
 
     #[test]

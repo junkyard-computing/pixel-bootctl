@@ -66,6 +66,17 @@ enum Cmd {
         #[arg(long)]
         slot: Option<char>,
     },
+    /// Mark a slot UNBOOTABLE in devinfo (retry=0, clear active+successful, set unbootable) and make
+    /// the other slot active — a one-reboot rollback to the other slot. Does NOT touch the boot LUN,
+    /// so it works from mainline where `boot_lun_enabled` is read-only and `set-active-slot` can't
+    /// switch away. The other slot must be a known-good (successful) slot.
+    MarkUnbootable {
+        #[arg(long, default_value = devinfo::DEVINFO_PATH)]
+        devinfo: PathBuf,
+        /// Slot to mark unbootable (a|b); defaults to the running slot.
+        #[arg(long)]
+        slot: Option<char>,
+    },
     /// Probe which Trusty service ports accept a connection (diagnostic).
     Probe {
         #[arg(long, default_value = trusty::DEFAULT_DEV)]
@@ -172,6 +183,32 @@ fn cmd_mark_successful(devinfo_path: &PathBuf, slot_override: Option<char>) -> i
     Ok(())
 }
 
+fn cmd_mark_unbootable(devinfo_path: &PathBuf, slot_override: Option<char>) -> io::Result<()> {
+    let slot = match slot_override {
+        Some(c) => devinfo::parse_slot(c)?,
+        None => slot::current()?,
+    };
+
+    // devinfo bookkeeping ONLY — no bootlun::set, so this works on mainline where the UFS
+    // boot_lun_enabled node is read-only. The bootloader honors UNBOOTABLE to roll back.
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(devinfo_path)?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    devinfo::apply_mark_unbootable(&mut buf, slot)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    let (su, other) = if slot == 0 { ('A', 'B') } else { ('B', 'A') };
+    println!(
+        "devinfo: slot {su} marked UNBOOTABLE (retry 0), slot {other} active — reboot rolls back to \
+         slot {other}."
+    );
+    Ok(())
+}
+
 fn cmd_probe(dev: &str, single: Option<&str>) {
     let ports: Vec<&str> = match single {
         Some(p) => vec![p],
@@ -222,6 +259,7 @@ fn main() -> io::Result<()> {
             mark_successful,
         } => cmd_set_active(slot, &devinfo, boot_lun, mark_successful)?,
         Cmd::MarkSuccessful { devinfo, slot } => cmd_mark_successful(&devinfo, slot)?,
+        Cmd::MarkUnbootable { devinfo, slot } => cmd_mark_unbootable(&devinfo, slot)?,
         Cmd::Probe { dev, port } => cmd_probe(&dev, port.as_deref()),
         Cmd::Send {
             dev,
