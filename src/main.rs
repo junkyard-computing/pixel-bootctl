@@ -165,13 +165,28 @@ fn cmd_set_active(
     Ok(())
 }
 
-fn cmd_mark_successful(devinfo_path: &PathBuf, slot_override: Option<char>) -> io::Result<()> {
-    // The running slot is authoritative; only fall back to it when no override is given.
-    let slot = match slot_override {
-        Some(c) => devinfo::parse_slot(c)?,
-        None => slot::current()?,
-    };
+/// Resolve the running slot for per-boot bookkeeping: an explicit `--slot` wins, then the
+/// authoritative `androidboot.slot_suffix`, then the devinfo ACTIVE flag. The last is the fallback
+/// for mainline, whose kernel cmdline carries no slot_suffix — the active slot is the one the
+/// bootloader just booted. `devinfo_buf` is the already-read devinfo image.
+fn resolve_slot(slot_override: Option<char>, devinfo_buf: &[u8]) -> io::Result<usize> {
+    if let Some(c) = slot_override {
+        return devinfo::parse_slot(c);
+    }
+    if let Ok(s) = slot::current() {
+        return Ok(s);
+    }
+    devinfo::Devinfo::parse(devinfo_buf)?
+        .active_slot()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no androidboot.slot_suffix and no active slot in devinfo; pass --slot <a|b>",
+            )
+        })
+}
 
+fn cmd_mark_successful(devinfo_path: &PathBuf, slot_override: Option<char>) -> io::Result<()> {
     // devinfo bookkeeping ONLY — deliberately no bootlun::set, so the per-boot retry-counter
     // reset keeps working even if the UFS boot_lun_enabled node can't be located.
     let mut f = OpenOptions::new()
@@ -180,6 +195,8 @@ fn cmd_mark_successful(devinfo_path: &PathBuf, slot_override: Option<char>) -> i
         .open(devinfo_path)?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
+    // Running slot is authoritative; fall back to it (or the devinfo active slot) when no override.
+    let slot = resolve_slot(slot_override, &buf)?;
     devinfo::apply_mark_successful(&mut buf, slot)?;
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&buf)?;
@@ -192,11 +209,6 @@ fn cmd_mark_successful(devinfo_path: &PathBuf, slot_override: Option<char>) -> i
 }
 
 fn cmd_mark_unbootable(devinfo_path: &PathBuf, slot_override: Option<char>) -> io::Result<()> {
-    let slot = match slot_override {
-        Some(c) => devinfo::parse_slot(c)?,
-        None => slot::current()?,
-    };
-
     // devinfo bookkeeping ONLY — no bootlun::set, so this works on mainline where the UFS
     // boot_lun_enabled node is read-only. The bootloader honors UNBOOTABLE to roll back.
     let mut f = OpenOptions::new()
@@ -205,6 +217,7 @@ fn cmd_mark_unbootable(devinfo_path: &PathBuf, slot_override: Option<char>) -> i
         .open(devinfo_path)?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
+    let slot = resolve_slot(slot_override, &buf)?;
     devinfo::apply_mark_unbootable(&mut buf, slot)?;
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&buf)?;

@@ -80,6 +80,12 @@ impl Devinfo {
             ],
         })
     }
+
+    /// Index of the slot the bootloader marked ACTIVE — i.e. the one it booted. Used as the
+    /// running-slot fallback on mainline, whose kernel cmdline carries no androidboot.slot_suffix.
+    pub fn active_slot(&self) -> Option<usize> {
+        self.slots.iter().position(|s| s.active)
+    }
 }
 
 /// Byte offset of a slot's 4-byte record (0 = A, 1 = B).
@@ -190,6 +196,21 @@ mod tests {
         b[0] = b'X';
         assert!(Devinfo::parse(&b).is_err());
         assert!(Devinfo::parse(&[0u8; 8]).is_err());
+    }
+
+    #[test]
+    fn active_slot_reports_booted_slot() {
+        // sample() has slot A active — the running-slot fallback on mainline.
+        assert_eq!(Devinfo::parse(&sample()).unwrap().active_slot(), Some(0));
+        // B active instead of A.
+        let mut b = sample();
+        b[49] = 0x02; // A: successful only, not active
+        b[53] = 0x0e; // B: successful|active|fastboot_ok
+        assert_eq!(Devinfo::parse(&b).unwrap().active_slot(), Some(1));
+        // No active slot at all.
+        let mut b = sample();
+        b[49] = 0x02;
+        assert_eq!(Devinfo::parse(&b).unwrap().active_slot(), None);
     }
 
     #[test]
