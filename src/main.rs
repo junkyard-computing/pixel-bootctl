@@ -15,6 +15,7 @@ mod devinfo;
 mod hexutil;
 mod slot;
 mod trusty;
+mod ufsbsg;
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -44,14 +45,24 @@ enum Cmd {
     /// Set the active boot slot (a|b): flips the UFS boot LUN + updates devinfo flags. Rollback-
     /// safe by default — the new slot is marked active but NOT successful, so a slot that never
     /// boots rolls back. Confirm it with `mark-successful` after a good boot.
+    ///
+    /// The boot-LUN backend autodetects: the AOSP kernel's writable
+    /// /sys/.../pixel/boot_lun_enabled node if present, else a WRITE ATTRIBUTE over the mainline
+    /// ufs-bsg endpoint (/dev/bsg/ufs-bsg0). Force one with --aosp / --linux.
     SetActiveSlot {
         /// Target slot: a or b.
         slot: char,
         #[arg(long, default_value = devinfo::DEVINFO_PATH)]
         devinfo: PathBuf,
-        /// boot_lun_enabled sysfs path (auto-detected if omitted).
+        /// boot_lun_enabled sysfs path (AOSP backend; auto-detected if omitted).
         #[arg(long)]
         boot_lun: Option<PathBuf>,
+        /// Force the AOSP writable-sysfs boot-LUN backend.
+        #[arg(long, conflicts_with = "linux")]
+        aosp: bool,
+        /// Force the mainline ufs-bsg WRITE ATTRIBUTE boot-LUN backend.
+        #[arg(long)]
+        linux: bool,
         /// Also mark the slot successful immediately (force-trust; DISABLES rollback). For
         /// manual recovery only — normally let a post-boot health check call `mark-successful`.
         #[arg(long)]
@@ -119,17 +130,14 @@ fn cmd_set_active(
     slot_char: char,
     devinfo_path: &PathBuf,
     boot_lun: Option<PathBuf>,
+    backend: bootlun::Backend,
     mark_successful: bool,
 ) -> io::Result<()> {
     let slot = devinfo::parse_slot(slot_char)?;
 
-    // 1) The real switch: UFS boot LUN.
-    let lun_path = bootlun::set(slot, boot_lun)?;
-    println!(
-        "boot LUN: wrote {} to {}",
-        bootlun::lun_value(slot),
-        lun_path.display()
-    );
+    // 1) The real switch: UFS boot LUN (AOSP sysfs or mainline ufs-bsg, per `backend`).
+    let lun_msg = bootlun::set(slot, backend, boot_lun)?;
+    println!("{lun_msg}");
 
     // 2) Bookkeeping: devinfo active/retry flags (+ successful only with --mark-successful).
     let mut f = OpenOptions::new()
@@ -256,8 +264,17 @@ fn main() -> io::Result<()> {
             slot,
             devinfo,
             boot_lun,
+            aosp,
+            linux,
             mark_successful,
-        } => cmd_set_active(slot, &devinfo, boot_lun, mark_successful)?,
+        } => {
+            let backend = match (aosp, linux) {
+                (true, _) => bootlun::Backend::Aosp,
+                (_, true) => bootlun::Backend::Linux,
+                _ => bootlun::Backend::Auto,
+            };
+            cmd_set_active(slot, &devinfo, boot_lun, backend, mark_successful)?
+        }
         Cmd::MarkSuccessful { devinfo, slot } => cmd_mark_successful(&devinfo, slot)?,
         Cmd::MarkUnbootable { devinfo, slot } => cmd_mark_unbootable(&devinfo, slot)?,
         Cmd::Probe { dev, port } => cmd_probe(&dev, port.as_deref()),

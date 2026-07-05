@@ -1,23 +1,41 @@
-// The actual A/B slot switch on Tensor: the UFS boot-LUN attribute, exposed by the Pixel
-// kernel as a sysfs file. Writing "1" selects boot LUN A (slot A), "2" selects B.
-//   /sys/devices/platform/<ufs>/pixel/boot_lun_enabled
-// This is what device/google/gs-common/bootctrl setActiveBootSlot writes; it needs no
-// fastboot, keys, GSA, or Trusty.
+// The actual A/B slot switch on Tensor: the UFS bBootLunEn attribute. Writing "1" selects boot
+// LUN A (slot A), "2" selects B. Two backends, autodetected:
+//
+//   AOSP  — the Pixel kernel exposes a *writable* sysfs node:
+//             /sys/devices/platform/<ufs>/pixel/boot_lun_enabled
+//           This is what device/google/gs-common/bootctrl setActiveBootSlot writes.
+//   Linux — mainline exposes boot_lun_enabled read-only under .../attributes/, so instead we
+//           issue the same WRITE ATTRIBUTE over the ufs-bsg endpoint (see ufsbsg.rs).
+//
+// Neither path needs fastboot, keys, GSA, or Trusty.
 
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use crate::ufsbsg;
+
 const PLATFORM_DIR: &str = "/sys/devices/platform";
 const UFS_SUFFIX: &str = ".ufs";
 const NODE_REL: &str = "pixel/boot_lun_enabled";
+
+/// Which backend performs the boot-LUN write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// Autodetect: use the AOSP sysfs node if present, else the mainline ufs-bsg endpoint.
+    Auto,
+    /// Force the AOSP writable sysfs node.
+    Aosp,
+    /// Force the mainline ufs-bsg WRITE ATTRIBUTE path.
+    Linux,
+}
 
 /// sysfs value for a slot index: A (0) -> "1", B (1) -> "2".
 pub fn lun_value(slot: usize) -> &'static str {
     if slot == 0 { "1" } else { "2" }
 }
 
-/// Find `/sys/devices/platform/<*.ufs>/pixel/boot_lun_enabled`.
+/// Find `/sys/devices/platform/<*.ufs>/pixel/boot_lun_enabled` (AOSP-only node).
 pub fn detect() -> io::Result<PathBuf> {
     for entry in fs::read_dir(PLATFORM_DIR)? {
         let p = entry?.path();
@@ -37,14 +55,39 @@ pub fn detect() -> io::Result<PathBuf> {
     ))
 }
 
-/// Write the boot LUN for `slot` to `path` (or the auto-detected node). Returns the path used.
-pub fn set(slot: usize, path: Option<PathBuf>) -> io::Result<PathBuf> {
+fn set_aosp(slot: usize, path: Option<PathBuf>) -> io::Result<String> {
     let path = match path {
         Some(p) => p,
         None => detect()?,
     };
     fs::write(&path, lun_value(slot))?;
-    Ok(path)
+    Ok(format!(
+        "boot LUN: wrote {} to {} (AOSP sysfs)",
+        lun_value(slot),
+        path.display()
+    ))
+}
+
+fn set_linux(slot: usize) -> io::Result<String> {
+    ufsbsg::set(slot)?;
+    Ok(format!(
+        "boot LUN: wrote {} to {} via ufs-bsg WRITE ATTRIBUTE (mainline)",
+        lun_value(slot),
+        ufsbsg::DEV
+    ))
+}
+
+/// Switch the active boot LUN for `slot`. `aosp_path` overrides the AOSP sysfs node location
+/// (implies the AOSP backend when `backend` is Auto). Returns a description of what was written.
+pub fn set(slot: usize, backend: Backend, aosp_path: Option<PathBuf>) -> io::Result<String> {
+    match backend {
+        Backend::Aosp => set_aosp(slot, aosp_path),
+        Backend::Linux => set_linux(slot),
+        Backend::Auto => match aosp_path.or_else(|| detect().ok()) {
+            Some(p) => set_aosp(slot, Some(p)),
+            None => set_linux(slot),
+        },
+    }
 }
 
 #[cfg(test)]
