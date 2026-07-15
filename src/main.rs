@@ -44,12 +44,12 @@ enum Cmd {
     },
     /// Print the running slot as a single letter (`a` or `b`). Prefers the kernel's
     /// `androidboot.slot_suffix`; when that is absent (e.g. a mainline boot image that carries no
-    /// Android bootconfig) it falls back to the UFS boot LUN. This is the boot_control
-    /// `GetCurrentSlot` primitive that pixel-ota consumes when the kernel exposes no suffix.
+    /// Android bootconfig) it falls back to the devinfo ACTIVE flag, which the bootloader repairs
+    /// to the slot it just booted. This is the boot_control `GetCurrentSlot` primitive that
+    /// pixel-ota consumes when the kernel exposes no suffix.
     CurrentSlot {
-        /// boot_lun_enabled sysfs path (auto-detected if omitted).
-        #[arg(long)]
-        boot_lun: Option<PathBuf>,
+        #[arg(long, default_value = devinfo::DEVINFO_PATH)]
+        devinfo: PathBuf,
     },
     /// Set the active boot slot (a|b): flips the UFS boot LUN + updates devinfo flags. Rollback-
     /// safe by default — the new slot is marked active but NOT successful, so a slot that never
@@ -135,15 +135,12 @@ fn cmd_status(path: &PathBuf) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_current_slot(boot_lun: Option<PathBuf>) -> io::Result<()> {
-    // The kernel's slot_suffix is the true running slot when present; the boot LUN is the
-    // hardware fallback for boots that carry no Android bootconfig (mainline). NOTE: the boot LUN
-    // reflects the *selected* slot, so between a `set-active-slot` and its reboot it reports the
-    // pending target, not the still-running slot — on a fresh boot the two agree.
-    let slot = match slot::current() {
-        Ok(s) => s,
-        Err(_) => bootlun::get(boot_lun)?,
-    };
+fn cmd_current_slot(devinfo_path: &PathBuf) -> io::Result<()> {
+    // Same resolution as the per-boot bookkeeping commands: slot_suffix when present, else the
+    // devinfo ACTIVE flag (the bootloader repairs it to the slot it just booted) for mainline.
+    let mut buf = Vec::new();
+    File::open(devinfo_path)?.read_to_end(&mut buf)?;
+    let slot = resolve_slot(None, &buf)?;
     println!("{}", if slot == 0 { 'a' } else { 'b' });
     Ok(())
 }
@@ -295,7 +292,7 @@ fn cmd_send(dev: &str, port: &str, hex: &str, timeout_ms: i32) -> io::Result<()>
 fn main() -> io::Result<()> {
     match Args::parse().cmd {
         Cmd::Status { devinfo } => cmd_status(&devinfo)?,
-        Cmd::CurrentSlot { boot_lun } => cmd_current_slot(boot_lun)?,
+        Cmd::CurrentSlot { devinfo } => cmd_current_slot(&devinfo)?,
         Cmd::SetActiveSlot {
             slot,
             devinfo,
