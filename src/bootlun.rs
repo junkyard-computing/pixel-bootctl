@@ -90,6 +90,39 @@ pub fn set(slot: usize, backend: Backend, aosp_path: Option<PathBuf>) -> io::Res
     }
 }
 
+/// Parse a `boot_lun_enabled` value into a slot index. The node is *written* as "1"/"2" but
+/// *reads back* as "0x1"/"0x2" on felix, so accept both forms. 1 -> A (0), 2 -> B (1).
+pub fn parse_lun_value(s: &str) -> Option<usize> {
+    let t = s.trim();
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    match t {
+        "1" => Some(0),
+        "2" => Some(1),
+        _ => None,
+    }
+}
+
+/// Read the current boot LUN from `path` (or the auto-detected node) and map it to a slot index
+/// (A=0, B=1). This is the hardware's view of which slot is selected to boot — the fallback
+/// "current slot" source when the kernel exposes no `androidboot.slot_suffix` (mainline boot).
+pub fn get(path: Option<PathBuf>) -> io::Result<usize> {
+    let path = match path {
+        Some(p) => p,
+        None => detect()?,
+    };
+    let raw = fs::read_to_string(&path)?;
+    parse_lun_value(&raw).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected boot_lun_enabled value {:?} in {}",
+                raw.trim(),
+                path.display()
+            ),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +131,23 @@ mod tests {
     fn lun_value_maps_slots() {
         assert_eq!(lun_value(0), "1"); // A -> boot LUN A
         assert_eq!(lun_value(1), "2"); // B -> boot LUN B
+    }
+
+    #[test]
+    fn parses_lun_value_write_and_read_forms() {
+        // Written form ("1"/"2") and the read-back hex form ("0x1"/"0x2"), with whitespace.
+        assert_eq!(parse_lun_value("1"), Some(0));
+        assert_eq!(parse_lun_value("2\n"), Some(1));
+        assert_eq!(parse_lun_value("0x1\n"), Some(0));
+        assert_eq!(parse_lun_value(" 0x2 "), Some(1));
+        assert_eq!(parse_lun_value("0X2"), Some(1));
+    }
+
+    #[test]
+    fn rejects_bad_lun_value() {
+        assert_eq!(parse_lun_value("0"), None);
+        assert_eq!(parse_lun_value("3"), None);
+        assert_eq!(parse_lun_value(""), None);
+        assert_eq!(parse_lun_value("0xff"), None);
     }
 }

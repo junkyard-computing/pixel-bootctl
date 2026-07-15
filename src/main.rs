@@ -42,6 +42,15 @@ enum Cmd {
         #[arg(long, default_value = devinfo::DEVINFO_PATH)]
         devinfo: PathBuf,
     },
+    /// Print the running slot as a single letter (`a` or `b`). Prefers the kernel's
+    /// `androidboot.slot_suffix`; when that is absent (e.g. a mainline boot image that carries no
+    /// Android bootconfig) it falls back to the UFS boot LUN. This is the boot_control
+    /// `GetCurrentSlot` primitive that pixel-ota consumes when the kernel exposes no suffix.
+    CurrentSlot {
+        /// boot_lun_enabled sysfs path (auto-detected if omitted).
+        #[arg(long)]
+        boot_lun: Option<PathBuf>,
+    },
     /// Set the active boot slot (a|b): flips the UFS boot LUN + updates devinfo flags. Rollback-
     /// safe by default — the new slot is marked active but NOT successful, so a slot that never
     /// boots rolls back. Confirm it with `mark-successful` after a good boot.
@@ -123,6 +132,19 @@ fn cmd_status(path: &PathBuf) -> io::Result<()> {
         println!("    active:      {}", s.active);
         println!("    fastboot ok: {}", s.fastboot_ok);
     }
+    Ok(())
+}
+
+fn cmd_current_slot(boot_lun: Option<PathBuf>) -> io::Result<()> {
+    // The kernel's slot_suffix is the true running slot when present; the boot LUN is the
+    // hardware fallback for boots that carry no Android bootconfig (mainline). NOTE: the boot LUN
+    // reflects the *selected* slot, so between a `set-active-slot` and its reboot it reports the
+    // pending target, not the still-running slot — on a fresh boot the two agree.
+    let slot = match slot::current() {
+        Ok(s) => s,
+        Err(_) => bootlun::get(boot_lun)?,
+    };
+    println!("{}", if slot == 0 { 'a' } else { 'b' });
     Ok(())
 }
 
@@ -273,6 +295,7 @@ fn cmd_send(dev: &str, port: &str, hex: &str, timeout_ms: i32) -> io::Result<()>
 fn main() -> io::Result<()> {
     match Args::parse().cmd {
         Cmd::Status { devinfo } => cmd_status(&devinfo)?,
+        Cmd::CurrentSlot { boot_lun } => cmd_current_slot(boot_lun)?,
         Cmd::SetActiveSlot {
             slot,
             devinfo,
